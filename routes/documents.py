@@ -589,7 +589,6 @@ def assess_metric_severity(metrics: dict) -> dict:
 async def explain_document(document_id: str) -> dict:
     """
     Generate AI analysis for medical document
-    FINAL FIX: If document exists in DB, it's already validated - no re-check needed
     """
     try:
         import json, re
@@ -603,28 +602,35 @@ async def explain_document(document_id: str) -> dict:
 
         doc_data = doc_snapshot.to_dict()
         raw_text = doc_data.get("rawText", "")
-        metrics = doc_data.get("metrics") or {}  # Handle None case
+        metrics = doc_data.get("metrics") or {}
 
         if not raw_text:
             raise HTTPException(status_code=400, detail="No text found in document")
 
-        # ✅ FINAL FIX: Documents in DB are already validated at upload
-        # No re-validation needed - trust the upload filter
         print(f"📄 Analyzing document: {doc_data.get('filename')}")
         print(f"📊 Document has {len(metrics)} metrics extracted")
         
-        # 📈 CALCULATE TRENDS - Compare with previous report
-        trends = calculate_trends(document_id, user_id, metrics)
-        print(f"📈 Trend analysis: {trends.get('hasPreviousReport', False)}")
+        # 📈 CALCULATE TRENDS
+        try:
+            trends = calculate_trends(document_id, user_id, metrics)
+            print(f"📈 Trend analysis: {trends.get('hasPreviousReport', False)}")
+        except Exception as trend_err:
+            print(f"⚠️ Trend calculation failed: {str(trend_err)}")
+            trends = {"hasPreviousReport": False, "previousDate": None, "changes": {}}
 
-        severity_data = assess_metric_severity(metrics)
-        print(f"🚨 Severity assessment: {severity_data.get('hasCritical', False)} critical, {severity_data.get('hasWarning', False)} warnings")
+        # CALCULATE SEVERITY
+        try:
+            severity_data = assess_metric_severity(metrics)
+            print(f"🚨 Severity assessment: {severity_data.get('hasCritical', False)} critical, {severity_data.get('hasWarning', False)} warnings")
+        except Exception as severity_err:
+            print(f"⚠️ Severity assessment failed: {str(severity_err)}")
+            severity_data = {"severity": {}, "criticalAlerts": None, "hasCritical": False, "hasWarning": False}
 
-
-        # ✨ ENHANCED SMART DOCTOR QUESTIONS PROMPT
+        # BUILD AI PROMPT
         metrics_summary = "\n".join([f"- {k.upper()}: {v}" for k, v in metrics.items()]) if metrics else "No metrics extracted yet"
         
         prompt = f"""Analyze this medical lab report. You MUST provide ALL 5 fields in your response.
+
 
 REPORT TEXT:
 {raw_text[:3000]}
@@ -656,24 +662,18 @@ Return ONLY this JSON (no markdown, no code blocks):
 
         print(f"📤 Sending prompt to Gemini AI...")
         
-        # Call Gemini AI with error handling for quota limits
+        # Call Gemini AI
         try:
             ai_response = summarize_text(prompt)
             print(f"📥 Received AI response: {len(ai_response)} characters")
         except Exception as gemini_error:
             error_str = str(gemini_error)
+            print(f"❌ Gemini API error: {error_str}")
             
             # Check if it's a quota error
             if "429" in error_str or "quota" in error_str.lower():
                 print(f"⚠️ Gemini quota exceeded, generating fallback response...")
-                
-                # Calculate trends even for fallback
-                trends = calculate_trends(document_id, user_id, metrics)
-                
-                # Generate smart fallback analysis using the metrics
                 fallback_analysis = generate_fallback_analysis(metrics, raw_text[:500])
-
-                severity_data = assess_metric_severity(metrics)  # ADD THIS LINE
                 
                 return {
                     "success": True,
@@ -681,13 +681,16 @@ Return ONLY this JSON (no markdown, no code blocks):
                     "filename": doc_data.get("filename"),
                     "metrics": metrics,
                     "trends": trends,
-                    "severity": severity_data,  # ADD THIS LINE
+                    "severity": severity_data,
                     "aiAnalysis": fallback_analysis,
                     "note": "Generated using fallback due to API quota limit"
                 }
             else:
-                # Other error, re-raise
-                raise
+                # Other Gemini error - raise it with details
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"AI service error: {error_str}"
+                )
 
         # Parse JSON response
         json_match = re.search(r'\{.*\}', ai_response, re.DOTALL)
@@ -695,67 +698,50 @@ Return ONLY this JSON (no markdown, no code blocks):
             try:
                 analysis = json.loads(json_match.group())
                 
-                # Validate required fields and add smart defaults if missing
+                # Validate and add defaults for missing fields
                 required_fields = ["summary", "keyFindings", "doctorQuestions", "recommendations"]
                 for field in required_fields:
                     if field not in analysis or not analysis[field]:
-                        print(f"⚠️ Missing or empty field '{field}', adding smart default")
+                        print(f"⚠️ Missing field '{field}', adding smart default")
                         
                         if field == "summary":
                             analysis[field] = "Analysis completed. Please review the findings below."
                         elif field == "doctorQuestions":
-                            # Generate smart default questions based on metrics
                             default_questions = []
                             if metrics.get('hba1c'):
                                 default_questions.append(f"My HbA1c is {metrics['hba1c']} - what does this mean for my diabetes risk?")
                                 default_questions.append(f"Should I start medication or can lifestyle changes help control my HbA1c of {metrics['hba1c']}?")
                             if metrics.get('glucose'):
                                 default_questions.append(f"My fasting glucose is {metrics['glucose']} - what dietary changes would help most?")
-                                default_questions.append(f"Should I monitor my blood sugar at home given my glucose level of {metrics['glucose']}?")
                             if not default_questions:
                                 default_questions = [
                                     "What do these results mean for my overall health?",
                                     "Should I make any lifestyle changes based on these findings?",
                                     "How often should I retest these values?"
                                 ]
-                            analysis[field] = default_questions[:5]  # Max 5 questions
+                            analysis[field] = default_questions[:5]
                         else:
                             analysis[field] = []
                 
-                # Ensure criticalAlerts exists
                 if "criticalAlerts" not in analysis:
                     analysis["criticalAlerts"] = None
                 
-                # Log success
-                print(f"✅ Analysis complete:")
-                print(f"   - Summary: {len(analysis.get('summary', ''))} chars")
-                print(f"   - Key Findings: {len(analysis.get('keyFindings', []))} items")
-                print(f"   - Doctor Questions: {len(analysis.get('doctorQuestions', []))} questions")
-                print(f"   - Recommendations: {len(analysis.get('recommendations', []))} items")
-                print(f"   - Critical Alerts: {analysis.get('criticalAlerts')}")
+                print(f"✅ Analysis complete - {len(analysis.get('doctorQuestions', []))} questions generated")
                     
             except json.JSONDecodeError as e:
                 print(f"❌ JSON Parse Error: {e}")
-                analysis = {
-                    "summary": "Failed to parse AI response. Please try again.",
-                    "keyFindings": [],
-                    "doctorQuestions": [],
-                    "recommendations": [],
-                    "criticalAlerts": None,
-                    "error": "JSON parse failed",
-                    "raw": ai_response[:300]
-                }
+                print(f"Raw AI response: {ai_response[:500]}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse AI response: {str(e)}"
+                )
         else:
             print(f"❌ No JSON found in AI response")
-            analysis = {
-                "summary": "AI response was not in expected format.",
-                "keyFindings": [],
-                "doctorQuestions": [],
-                "recommendations": [],
-                "criticalAlerts": None,
-                "error": "No JSON returned",
-                "raw": ai_response[:300]
-            }
+            print(f"Raw response: {ai_response[:500]}")
+            raise HTTPException(
+                status_code=500,
+                detail="AI response was not in expected JSON format"
+            )
 
         return {
             "success": True,
@@ -763,17 +749,20 @@ Return ONLY this JSON (no markdown, no code blocks):
             "filename": doc_data.get("filename"),
             "metrics": metrics,
             "trends": trends,
-            "severity": severity_data,  # ADD THIS LINE
+            "severity": severity_data,
             "aiAnalysis": analysis
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Exception in explain_document: {str(e)}")
+        print(f"❌ Unexpected error in explain_document: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Analysis failed: {str(e)}"
+        )
     # At the end of your routes/documents.py file, add:
 
 @router.delete("/documents/{document_id}")
