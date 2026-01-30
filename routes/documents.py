@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Any         
 import uuid
 from services.gemini_client import summarize_text
+from services.health_score import calculate_health_score
+
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
@@ -728,6 +730,7 @@ Return ONLY this JSON (no markdown, no code blocks):
                 
                 print(f"✅ Analysis complete - {len(analysis.get('doctorQuestions', []))} questions generated")
                     
+                    
             except json.JSONDecodeError as e:
                 print(f"❌ JSON Parse Error: {e}")
                 print(f"Raw AI response: {ai_response[:500]}")
@@ -790,6 +793,63 @@ async def delete_document(document_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
     
     # Add this endpoint to your routes/documents.py
+
+
+@router.get("/health-score/{document_id}")
+async def get_health_score(document_id: str) -> dict:
+    """
+    Calculate comprehensive health score and risk assessment for a document
+    """
+    try:
+        user_id = get_current_user_id()
+        doc_ref = db.collection("users").document(user_id).collection("documents").document(document_id)
+        doc_snapshot = doc_ref.get()
+
+        if not doc_snapshot.exists:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        doc_data = doc_snapshot.to_dict()
+        metrics = doc_data.get("metrics") or {}
+
+        if not metrics:
+            raise HTTPException(status_code=400, detail="No metrics found in document")
+
+        # Calculate health score
+        health_score_data = calculate_health_score(metrics)
+        
+        # Get historical scores for trend
+        historical_scores = []
+        try:
+            docs = db.collection("users").document(user_id).collection("documents").order_by("uploadDate", direction="DESCENDING").limit(5).stream()
+            
+            for doc in docs:
+                data = doc.to_dict()
+                if data.get('metrics'):
+                    score_calc = calculate_health_score(data.get('metrics'))
+                    historical_scores.append({
+                        "date": data.get('uploadDate'),
+                        "score": score_calc['overallScore'],
+                        "grade": score_calc['grade']
+                    })
+        except:
+            pass
+        
+        return {
+            "success": True,
+            "documentId": document_id,
+            "healthScore": health_score_data,
+            "historicalScores": historical_scores,
+            "metrics": metrics
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error calculating health score: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to calculate health score: {str(e)}")
+
 
 @router.get("/chart-data")
 async def get_chart_data():
